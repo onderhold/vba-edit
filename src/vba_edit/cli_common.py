@@ -7,8 +7,6 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from twine import metadata
-
 from vba_edit.console import error, info, warning
 from vba_edit.exceptions import VBAExportWarning
 from vba_edit.utils import confirm_action, get_windows_ansi_codepage
@@ -96,13 +94,6 @@ PLACEHOLDER_FILE_NAME = "{file.name}"
 PLACEHOLDER_FILE_FULLNAME = "{file.fullname}"
 PLACEHOLDER_FILE_PATH = "{file.path}"
 PLACEHOLDER_FILE_VBAPROJECT = "{file.vbaproject}"
-# Legacy placeholders for backward compatibility (deprecated in v0.4.1, will be removed in v0.5.0)
-PLACEHOLDER_FILE_NAME_LEGACY = "{general.file.name}"
-PLACEHOLDER_FILE_FULLNAME_LEGACY = "{general.file.fullname}"
-PLACEHOLDER_FILE_PATH_LEGACY = "{general.file.path}"
-PLACEHOLDER_VBA_PROJECT_LEGACY = "{vbaproject}"
-# Aliases for test compatibility (deprecated, use new names above)
-PLACEHOLDER_VBA_PROJECT = PLACEHOLDER_VBA_PROJECT_LEGACY  # For backward compatibility in tests
 
 # TOML configuration section constants
 CONFIG_SECTION_GENERAL = "general"
@@ -209,11 +200,6 @@ def get_placeholder_values(config_file_path: Optional[str] = None, file_path: Op
         PLACEHOLDER_FILE_FULLNAME: "",
         PLACEHOLDER_FILE_PATH: "",
         PLACEHOLDER_FILE_VBAPROJECT: "",  # Resolved later
-        # Legacy format (deprecated)
-        PLACEHOLDER_FILE_NAME_LEGACY: "",
-        PLACEHOLDER_FILE_FULLNAME_LEGACY: "",
-        PLACEHOLDER_FILE_PATH_LEGACY: "",
-        PLACEHOLDER_VBA_PROJECT_LEGACY: "",  # Resolved later
     }
 
     # Get config file directory for relative path resolution
@@ -240,10 +226,6 @@ def get_placeholder_values(config_file_path: Optional[str] = None, file_path: Op
             placeholders[PLACEHOLDER_FILE_NAME] = file_name
             placeholders[PLACEHOLDER_FILE_FULLNAME] = file_fullname
             placeholders[PLACEHOLDER_FILE_PATH] = file_path_str
-            # Legacy format (same values)
-            placeholders[PLACEHOLDER_FILE_NAME_LEGACY] = file_name
-            placeholders[PLACEHOLDER_FILE_FULLNAME_LEGACY] = file_fullname
-            placeholders[PLACEHOLDER_FILE_PATH_LEGACY] = file_path_str
 
     return placeholders
 
@@ -277,78 +259,6 @@ def resolve_all_placeholders(args: argparse.Namespace, config_file_path: Optiona
         args_dict["_config_file_path"] = config_file_path
 
     return argparse.Namespace(**args_dict)
-
-
-def resolve_vbaproject_placeholder_in_args(args: argparse.Namespace, vba_project_name: str) -> argparse.Namespace:
-    """Resolve the {file.vbaproject} and legacy {vbaproject} placeholders after VBA project name is known.
-
-    Supports both new simplified placeholder ({file.vbaproject}) and legacy one ({vbaproject})
-    for backward compatibility.
-
-    Args:
-        args: Command-line arguments
-        vba_project_name: Name of the VBA project
-
-    Returns:
-        Arguments with vbaproject placeholders resolved
-    """
-    args_dict = vars(args).copy()
-
-    # Resolve both new and legacy placeholders in all string arguments
-    for key, value in args_dict.items():
-        if isinstance(value, str):
-            # New format
-            value = value.replace(PLACEHOLDER_FILE_VBAPROJECT, vba_project_name)
-            # Legacy format
-            value = value.replace(PLACEHOLDER_VBA_PROJECT_LEGACY, vba_project_name)
-            args_dict[key] = value
-
-    return argparse.Namespace(**args_dict)
-
-
-def resolve_config_placeholders_recursive(value, placeholders: Dict[str, str]):
-    """Recursively resolve placeholders in nested configuration structures.
-
-    Args:
-        value: Value to process (can be dict, list, or string)
-        placeholders: Dictionary mapping placeholder names to values
-
-    Returns:
-        Value with placeholders resolved
-    """
-    if isinstance(value, str):
-        return resolve_placeholders_in_value(value, placeholders)
-    elif isinstance(value, dict):
-        return {k: resolve_config_placeholders_recursive(v, placeholders) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [resolve_config_placeholders_recursive(item, placeholders) for item in value]
-    else:
-        return value
-
-
-def resolve_vbaproject_placeholder(config: Dict[str, Any], vba_project_name: str) -> Dict[str, Any]:
-    """Resolve the {file.vbaproject} and legacy {vbaproject} placeholders after VBA project name is known.
-
-    Supports both new simplified placeholder ({file.vbaproject}) and legacy one ({vbaproject})
-    for backward compatibility.
-
-    Args:
-        config: Configuration dictionary
-        vba_project_name: Name of the VBA project
-
-    Returns:
-        Configuration with vbaproject placeholders resolved
-    """
-    import copy
-
-    resolved_config = copy.deepcopy(config)
-
-    placeholders = {
-        PLACEHOLDER_FILE_VBAPROJECT: vba_project_name,  # New format
-        PLACEHOLDER_VBA_PROJECT_LEGACY: vba_project_name,  # Legacy format
-    }
-
-    return resolve_config_placeholders_recursive(resolved_config, placeholders)
 
 
 def _enhance_toml_error_message(config_path: str, text: str, err: Exception) -> str:
@@ -495,7 +405,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_command_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add common arguments to a parser.
+    """Add common command arguments to a parser.
 
     These are arguments common to edit/import/export commands.
     Global options (--version, --help) are added at the main parser level.
@@ -509,13 +419,13 @@ def add_command_arguments(parser: argparse.ArgumentParser) -> None:
         "--file",
         "-f",
         dest="file",
-        help="Path to Office document (optional, default: active document).",
+        help="Path to Office document (default: active document).",
     )
     file_group.add_argument(
         "--vba-directory",
         dest="vba_directory",
         metavar="DIR",
-        help="Directory to export VBA files to (optional, default: same directory as document).\n"
+        help="Directory to export VBA files to (default: same directory as document).\n"
         f"Supports placeholders: {PLACEHOLDER_FILE_NAME}, {PLACEHOLDER_FILE_FULLNAME}, {PLACEHOLDER_FILE_PATH}, {PLACEHOLDER_CONFIG_PATH}, {PLACEHOLDER_FILE_VBAPROJECT}",
     )
 
@@ -533,9 +443,9 @@ def add_vba_files_arguments(parser: argparse.ArgumentParser) -> None:
     vba_src_file_group = parser.add_argument_group("Source File Organization")
     vba_src_file_group.add_argument(
         "--rubberduck-folders",
+        dest="rubberduck_folders",
         action="store_true",
-        default=None,
-        help="If a module contains a RubberduckVBA '@Folder annotation, organize folders in the file system accordingly",
+        help="Organize folders per RubberduckVBA @Folder annotations",
     )
 
 
@@ -555,8 +465,7 @@ def add_exporting_arguments(parser: argparse.ArgumentParser) -> None:
         "--force-overwrite",
         dest="force_overwrite",
         action="store_true",
-        default=False,
-        help="Force overwrite of existing files without prompting for confirmation (use with caution)",
+        help="Force overwrite of existing files without prompting",
     )
     exporting_group.add_argument(
         "--open-folder",
@@ -578,7 +487,6 @@ def add_after_export_arguments(parser: argparse.ArgumentParser) -> None:
         "--keep-open",
         dest="keep_open",
         action="store_true",
-        default=False,
         help="Keep document open after export (default: close after export)",
     )
 
@@ -669,15 +577,14 @@ def add_encoding_arguments(parser: argparse.ArgumentParser) -> None:
         "-e",
         dest="encoding",
         metavar="ENCODING",
-        help=f"Encoding used for reading/writing VBA files (e.g. 'utf-8', 'windows-1252', default: {default_encoding})",
         default=default_encoding,
+        help=f"Encoding used for reading/writing VBA files (e.g. 'utf-8', 'windows-1252', default: {default_encoding})",
     )
     encoding_mutex.add_argument(
         "--detect-encoding",
         "-d",
         dest="detect_encoding",
         action="store_true",
-        default=None,
         help="Auto-detect file encoding for VBA files",
     )
 
@@ -694,15 +601,13 @@ def add_header_arguments(parser: argparse.ArgumentParser) -> None:
         "--save-headers",
         dest="save_headers",
         action="store_true",
-        default=False,
-        help="Save VBA component headers to separate .header files (default: False)",
+        help="Save VBA component headers to separate .header files",
     )
     header_mutex.add_argument(
         "--in-file-headers",
         dest="in_file_headers",
         action="store_true",
-        default=False,
-        help="Include VBA headers directly in code files instead of separate .header files (default: False)",
+        help="Include VBA headers directly in code files",
     )
 
 
@@ -727,8 +632,7 @@ def add_metadata_arguments(parser: argparse.ArgumentParser) -> None:
         "-m",
         dest="save_metadata",
         action="store_true",
-        default=None,
-        help="Save metadata file with character encoding information (default: False)",
+        help="Save metadata to file",
     )
 
 

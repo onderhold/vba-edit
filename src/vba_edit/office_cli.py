@@ -55,18 +55,22 @@ Other modules with special handling (like Excel) can still implement their uniqu
 
 import argparse
 import logging
-from operator import add
+
 import sys
 from pathlib import Path
 
 from vba_edit import __name__ as package_name
 from vba_edit import __version__ as package_version
 from vba_edit.cli_common import (
+    CONFIG_SECTION_GENERAL,
+    PLACEHOLDER_FILE_VBAPROJECT,
     add_after_export_arguments,
     add_common_option_group,
     add_config_arguments,
     handle_export_with_warnings,
-    process_config_file,
+    load_config_file,
+    merge_config_with_args,
+    resolve_all_placeholders,
     validate_header_options,
     get_command_usage,
     get_command_description,
@@ -91,7 +95,8 @@ from vba_edit.exceptions import (
 from vba_edit.help_formatter import ColorizedArgumentParser, EnhancedHelpFormatter
 from vba_edit.office_vba import ExcelVBAHandler, WordVBAHandler, AccessVBAHandler, PowerPointVBAHandler
 from vba_edit.path_utils import get_document_paths
-from vba_edit.utils import get_active_office_document, get_windows_ansi_codepage, setup_logging
+from vba_edit.utils import get_active_office_document, setup_logging
+from vba_edit.console import error
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -172,6 +177,36 @@ class OfficeVBACLI:
             return _get_office_function(self.office_app, function_name)
         return function_name
 
+    def _collect_parser_dests(self, parser: argparse.ArgumentParser) -> set:
+        dests = set()
+        for action in parser._actions:
+            if action.dest and action.dest is not argparse.SUPPRESS:
+                dests.add(action.dest)
+            if isinstance(action, argparse._SubParsersAction):
+                for subparser in action.choices.values():
+                    dests.update(self._collect_parser_dests(subparser))
+        return dests
+
+    def _get_subparser(self, parser: argparse.ArgumentParser, command: str) -> argparse.ArgumentParser | None:
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action.choices.get(command)
+        return None
+
+    def _get_config_defaults(self, parser: argparse.ArgumentParser, config: dict) -> dict:
+        defaults = {}
+        general_config = config.get(CONFIG_SECTION_GENERAL, {})
+        if not isinstance(general_config, dict):
+            return defaults
+
+        known_dests = self._collect_parser_dests(parser)
+        for key, value in general_config.items():
+            arg_key = key.replace("-", "_")
+            if arg_key in known_dests:
+                defaults[arg_key] = value
+
+        return defaults
+
     def create_cli_parser(self) -> argparse.ArgumentParser:
         """Create the command-line interface parser."""
         entry_point_name = self.config["entry_point"]
@@ -214,7 +249,6 @@ class OfficeVBACLI:
         import_parser = subparsers.add_parser(
             "import",
             usage=get_command_usage("import", self.office_app),
-            # "Import VBA from filesystem into database"
             help=get_help_string("import", self.office_app),
             description=get_command_description("import", self.office_app),
             formatter_class=EnhancedHelpFormatter,
@@ -229,7 +263,6 @@ class OfficeVBACLI:
         export_parser = subparsers.add_parser(
             "export",
             usage=get_command_usage("export", self.office_app),
-            # "Import VBA from filesystem into database"
             help=get_help_string("export", self.office_app),
             description=get_command_description("export", self.office_app),
             formatter_class=EnhancedHelpFormatter,
@@ -246,7 +279,6 @@ class OfficeVBACLI:
         edit_parser = subparsers.add_parser(
             "edit",
             usage=get_command_usage("edit", self.office_app),
-            # "Edit in external editor, sync changes back to database",
             help=get_help_string("edit", self.office_app),
             description=get_command_description("edit", self.office_app),
             formatter_class=EnhancedHelpFormatter,
@@ -262,7 +294,6 @@ class OfficeVBACLI:
         check_parser = subparsers.add_parser(
             "check",
             usage=get_command_usage("check", self.office_app),
-            # "Check VBA project access settings"
             help=get_help_string("check", self.office_app),
             description=get_command_description("check", self.office_app),
             formatter_class=EnhancedHelpFormatter,
@@ -286,10 +317,12 @@ class OfficeVBACLI:
             raise FileNotFoundError(f"{file_type.title()} not found: {args.file}")
 
         if args.vba_directory:
-            vba_dir = Path(args.vba_directory)
-            if not vba_dir.exists():
-                self.logger.info(f"Creating VBA directory: {vba_dir}")
-                vba_dir.mkdir(parents=True, exist_ok=True)
+            # Only create the VBA directory if there's no PLACEHOLDER_FILE_VBAPROJECT value, or if it is already resolved
+            if PLACEHOLDER_FILE_VBAPROJECT not in args.vba_directory:
+                vba_dir = Path(args.vba_directory)
+                if not vba_dir.exists():
+                    self.logger.info(f"Creating VBA directory: {vba_dir}")
+                    vba_dir.mkdir(parents=True, exist_ok=True)
 
     def handle_office_vba_command(self, args: argparse.Namespace) -> None:
         """Handle the office-vba command execution."""
@@ -431,10 +464,33 @@ class OfficeVBACLI:
                 show_workflow_diagram()
 
             parser = self.create_cli_parser()
+            pre_args, _ = parser.parse_known_args()
+            config = None
+            config_load_failed = False
+            command = getattr(pre_args, "command", None)
+            config_path = getattr(pre_args, "conf", None)
+            if command in {"edit", "import", "export"} and config_path:
+                try:
+                    config = load_config_file(config_path)
+                except Exception as e:
+                    error(f"Error loading configuration file: {e}")
+                    config_load_failed = True
+                else:
+                    subparser = self._get_subparser(parser, command)
+                    target_parser = subparser or parser
+                    config_defaults = self._get_config_defaults(target_parser, config)
+                    if config_defaults:
+                        target_parser.set_defaults(**config_defaults)
+
             args = parser.parse_args()
 
-            # Process configuration file BEFORE setting up logging
-            args = process_config_file(args)
+            # Apply configuration and resolve placeholders BEFORE setting up logging
+            if not config_load_failed:
+                if config and getattr(args, "conf", None):
+                    args = merge_config_with_args(args, config)
+                    args = resolve_all_placeholders(args, args.conf)
+                else:
+                    args = resolve_all_placeholders(args, None)
 
             # Set up logging first
             setup_logging(verbose=getattr(args, "verbose", False), logfile=getattr(args, "logfile", None))
